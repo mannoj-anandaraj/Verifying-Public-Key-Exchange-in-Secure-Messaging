@@ -4,9 +4,14 @@ Signal Protocol Simulation with SMT Key Logging
 Verifying Public Key Exchange in Secure Messaging
 Mannoj Anandaraj  |  25132766  |  KCL MSc Project 2025-26
 
-Simulates the key exchange points in X3DH and Double Ratchet
-where ephemeral keys are generated, transmitted, and logged
-to the Sparse Merkle Tree.
+Real cryptographic implementation using:
+  - Curve25519 (X25519) for all key pairs and DH operations   [PyNaCl]
+  - HKDF-SHA256 (RFC 5869) for key derivation                 [PyNaCl]
+  - AES-256-GCM for authenticated encryption                  [PyCryptodome]
+
+This simulates the key exchange points in X3DH and Double Ratchet
+where ephemeral keys are generated, transmitted, and logged to the
+Sparse Merkle Tree.
 
 This is NOT a full Signal implementation — it simulates the
 cryptographic key exchange structure to demonstrate where
@@ -26,52 +31,109 @@ References:
 import hashlib
 import hmac
 import os
+import struct
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
+# Real cryptographic libraries
+from nacl.public import PrivateKey as X25519PrivateKey, PublicKey as X25519PublicKey, Box
+from nacl.bindings import crypto_scalarmult
+import nacl.hash
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+
 from smt import SparseMerkleTree, SMTProof
 
 
-# ── Cryptographic primitives (simplified) ────────────────────────────────────
+# ── Real Curve25519 / X25519 primitives ──────────────────────────────────────
+
+def _generate_keypair() -> Tuple[bytes, bytes]:
+    """
+    Generate a real Curve25519 key pair.
+    Returns (private_key_bytes, public_key_bytes) — both 32 bytes.
+
+    Uses PyNaCl's X25519 implementation, the same curve Signal uses
+    for X3DH and Double Ratchet key operations.
+    """
+    sk = X25519PrivateKey.generate()
+    return bytes(sk), bytes(sk.public_key)
+
+
+def _dh(private_key: bytes, public_key: bytes) -> bytes:
+    """
+    Real X25519 Diffie-Hellman operation.
+    Returns 32-byte shared output = X25519(private, public).
+
+    This is the actual DH function used in Signal's X3DH and
+    Double Ratchet — crypto_scalarmult is the PyNaCl binding
+    for X25519 scalar multiplication.
+    """
+    return crypto_scalarmult(private_key, public_key)
+
+
+def _hkdf(ikm: bytes, info: bytes, salt: bytes = None, length: int = 32) -> bytes:
+    """
+    Real HKDF-SHA256 (RFC 5869).
+
+    Extract-then-expand:
+      PRK  = HMAC-SHA256(salt, IKM)      [extract]
+      OKM  = HMAC-SHA256(PRK, info||ctr) [expand]
+    """
+    # Extract
+    if salt is None:
+        salt = b"\x00" * 32
+    prk = hmac.new(salt, ikm, hashlib.sha256).digest()
+
+    # Expand
+    output = b""
+    prev = b""
+    ctr = 1
+    while len(output) < length:
+        prev = hmac.new(prk, prev + info + bytes([ctr]), hashlib.sha256).digest()
+        output += prev
+        ctr += 1
+    return output[:length]
+
+
+def _encrypt(key: bytes, plaintext: bytes) -> bytes:
+    """
+    Real AES-256-GCM authenticated encryption.
+    Returns nonce (12 bytes) || ciphertext || tag (16 bytes).
+    """
+    nonce = get_random_bytes(12)
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(plaintext)
+    return nonce + ciphertext + tag
+
+
+def _decrypt(key: bytes, ciphertext: bytes) -> bytes:
+    """
+    Real AES-256-GCM authenticated decryption.
+    Raises ValueError if authentication tag fails.
+    """
+    nonce = ciphertext[:12]
+    tag   = ciphertext[-16:]
+    ct    = ciphertext[12:-16]
+    cipher = AES.new(key, AES.MODE_GCM, nonce=nonce)
+    return cipher.decrypt_and_verify(ct, tag)
+
 
 def _sha256(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
-
-def _hkdf(ikm: bytes, info: bytes, length: int = 32) -> bytes:
-    """Simplified HKDF — in real Signal uses full RFC5869 HKDF."""
-    prk = hmac.new(b"\x00" * 32, ikm, hashlib.sha256).digest()
-    return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()[:length]
-
-def _dh(private_key: bytes, public_key: bytes) -> bytes:
-    """Simulate DH(private, public) — in real Signal uses X25519."""
-    # XOR simulation — replace with real X25519 in production
-    return _sha256(b"DH:" + private_key + b":" + public_key)
-
-def _generate_keypair() -> Tuple[bytes, bytes]:
-    """Generate (private_key, public_key) pair."""
-    private = os.urandom(32)
-    # In real Signal: public = X25519(private, G) using Curve25519
-    public = _sha256(b"PK:" + private)
-    return private, public
-
-def _encrypt(key: bytes, plaintext: bytes) -> bytes:
-    """Simulate symmetric encryption — in real Signal uses AES-256-GCM."""
-    return _sha256(key + plaintext) + plaintext  # simplified
-
-def _decrypt(key: bytes, ciphertext: bytes) -> bytes:
-    """Simulate decryption."""
-    return ciphertext[32:]  # strip the simulated MAC
 
 
 # ── Key types ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class IdentityKeyPair:
-    """Long-term identity key — never rotates."""
+    """
+    Long-term identity key — never rotates.
+    Real Curve25519 key pair generated via PyNaCl.
+    """
     private: bytes
-    public: bytes
-    owner: str
+    public:  bytes
+    owner:   str
 
     @classmethod
     def generate(cls, owner: str) -> "IdentityKeyPair":
@@ -85,11 +147,13 @@ class PreKeyBundle:
     Bob's prekey bundle — uploaded to server before any session.
     Contains the keys X3DH needs to establish a shared secret
     even when Bob is offline.
+
+    All keys are real Curve25519 key pairs.
     """
-    identity_key_pub:   bytes   # IK_B
-    signed_prekey_pub:  bytes   # SPK_B (rotated periodically)
-    signed_prekey_priv: bytes
-    one_time_prekey_pub:  bytes   # OPK_B (consumed once)
+    identity_key_pub:     bytes   # IK_B  — long-term
+    signed_prekey_pub:    bytes   # SPK_B — rotated periodically
+    signed_prekey_priv:   bytes
+    one_time_prekey_pub:  bytes   # OPK_B — consumed once per session
     one_time_prekey_priv: bytes
     owner: str
 
@@ -98,11 +162,11 @@ class PreKeyBundle:
         spk_priv, spk_pub = _generate_keypair()
         opk_priv, opk_pub = _generate_keypair()
         return cls(
-            identity_key_pub     = identity.public,
-            signed_prekey_pub    = spk_pub,
-            signed_prekey_priv   = spk_priv,
-            one_time_prekey_pub  = opk_pub,
-            one_time_prekey_priv = opk_priv,
+            identity_key_pub      = identity.public,
+            signed_prekey_pub     = spk_pub,
+            signed_prekey_priv    = spk_priv,
+            one_time_prekey_pub   = opk_pub,
+            one_time_prekey_priv  = opk_priv,
             owner = identity.owner,
         )
 
@@ -110,9 +174,9 @@ class PreKeyBundle:
 @dataclass
 class X3DHResult:
     """Output of the X3DH key exchange."""
-    shared_secret:   bytes   # SK — used to initialise Double Ratchet
-    ephemeral_key_pub: bytes # EK_A — Alice's ephemeral key (logged to SMT)
-    session_id:      str
+    shared_secret:    bytes   # SK — used to initialise Double Ratchet
+    ephemeral_key_pub: bytes  # EK_A — Alice's ephemeral key (logged to SMT)
+    session_id:       str
 
 
 @dataclass
@@ -133,12 +197,12 @@ class LoggedKeyEvent:
     A key exchange event recorded in the SMT log.
     Captures everything needed for MITM detection.
     """
-    event_type:   str     # "X3DH_EPHEMERAL", "X3DH_OPK", "RATCHET"
-    owner:        str
-    public_key:   bytes   # the key being logged
-    session_id:   str
-    timestamp:    float
-    smt_root:     bytes   # root hash AFTER this key was logged
+    event_type:  str     # "X3DH_EPHEMERAL", "X3DH_OPK", "RATCHET"
+    owner:       str
+    public_key:  bytes   # the key being logged
+    session_id:  str
+    timestamp:   float
+    smt_root:    bytes   # root hash AFTER this key was logged
 
 
 # ── SMT Key Transparency Log ──────────────────────────────────────────────────
@@ -169,18 +233,14 @@ class KeyTransparencyLog:
     ) -> LoggedKeyEvent:
         """
         Log an ephemeral public key into the SMT.
-
         The SMT key is derived from (owner, session_id, event_type)
         to ensure each distinct key exchange event has a unique position.
         """
-        # Unique key for this exchange event
         log_key = _sha256(
             owner.encode() + b":" +
             session_id.encode() + b":" +
             event_type.encode()
         )
-
-        # Insert into SMT — value is the actual public key
         new_root = self.tree.insert(log_key, public_key)
 
         event = LoggedKeyEvent(
@@ -203,10 +263,7 @@ class KeyTransparencyLog:
         session_id: str,
         event_type: str = "KEY",
     ) -> SMTProof:
-        """
-        Generate a proof that a key was (or was not) logged.
-        Bob calls this to verify the key he received.
-        """
+        """Generate a proof that a key was (or was not) logged."""
         log_key = _sha256(
             owner.encode() + b":" +
             session_id.encode() + b":" +
@@ -225,7 +282,6 @@ class KeyTransparencyLog:
         """
         Verify that a received public_key matches what is in the log.
         This is what Bob calls when he receives a key from Alice.
-
         Returns True if the key is valid, False if MITM detected.
         """
         log_key = _sha256(
@@ -234,13 +290,11 @@ class KeyTransparencyLog:
             event_type.encode()
         )
         proof = self.tree.prove(log_key)
-        root = expected_root or self.tree.root
+        root  = expected_root or self.tree.root
 
         if proof.is_member:
             return SparseMerkleTree.verify_inclusion(log_key, public_key, proof, root)
-        else:
-            # Key not in log — non-inclusion proof
-            return False
+        return False
 
     @property
     def current_root(self) -> bytes:
@@ -256,26 +310,24 @@ def x3dh_initiate(
     session_id: str,
 ) -> X3DHResult:
     """
-    Alice initiates an X3DH session with Bob.
+    Alice initiates an X3DH session with Bob using real Curve25519 keys.
 
-    Key exchange:
-      DH1 = DH(IK_A, SPK_B)
-      DH2 = DH(EK_A, IK_B)
-      DH3 = DH(EK_A, SPK_B)
-      DH4 = DH(EK_A, OPK_B)
-      SK  = KDF(DH1 || DH2 || DH3 || DH4)
+    Real X3DH key exchange (RFC / Signal spec):
+      DH1 = X25519(IK_A_priv,  SPK_B_pub)
+      DH2 = X25519(EK_A_priv,  IK_B_pub)
+      DH3 = X25519(EK_A_priv,  SPK_B_pub)
+      DH4 = X25519(EK_A_priv,  OPK_B_pub)
+      SK  = HKDF-SHA256(DH1 || DH2 || DH3 || DH4)
 
-    EK_A and OPK_B are logged to the SMT immediately.
-    If an attacker substitutes EK_A or OPK_B in transit,
-    Bob's verification will fail.
+    EK_A is logged to the SMT immediately after generation.
     """
     print(f"\n[X3DH] Alice initiating session with Bob (session={session_id})")
 
-    # Alice generates her ephemeral key EK_A
+    # Alice generates real Curve25519 ephemeral key pair EK_A
     ek_priv, ek_pub = _generate_keypair()
     print(f"  [X3DH] Alice generated EK_A = {ek_pub[:8].hex()}...")
 
-    # Log EK_A to the SMT — this is the key contribution
+    # Log EK_A to the SMT
     log.log_key(
         owner      = f"alice_ek_{session_id}",
         public_key = ek_pub,
@@ -291,21 +343,24 @@ def x3dh_initiate(
         event_type = "X3DH_OPK",
     )
 
-    # Compute DH values (as per X3DH spec)
-    dh1 = _dh(alice.private, bob_bundle.signed_prekey_pub)   # DH(IK_A, SPK_B)
-    dh2 = _dh(ek_priv,       alice.public)                   # DH(EK_A, IK_B) — simplified
-    dh3 = _dh(ek_priv,       bob_bundle.signed_prekey_pub)   # DH(EK_A, SPK_B)
-    dh4 = _dh(ek_priv,       bob_bundle.one_time_prekey_pub) # DH(EK_A, OPK_B)
+    # Real X25519 DH operations
+    dh1 = _dh(alice.private,  bob_bundle.signed_prekey_pub)    # DH(IK_A,  SPK_B)
+    dh2 = _dh(ek_priv,        bob_bundle.identity_key_pub)     # DH(EK_A,  IK_B)
+    dh3 = _dh(ek_priv,        bob_bundle.signed_prekey_pub)    # DH(EK_A,  SPK_B)
+    dh4 = _dh(ek_priv,        bob_bundle.one_time_prekey_pub)  # DH(EK_A,  OPK_B)
 
-    # Derive shared secret
-    shared_secret = _hkdf(dh1 + dh2 + dh3 + dh4, b"X3DH_SK_" + session_id.encode())
+    # HKDF-SHA256 to derive shared secret
+    shared_secret = _hkdf(
+        ikm  = dh1 + dh2 + dh3 + dh4,
+        info = b"X3DH_SK_" + session_id.encode(),
+    )
     print(f"  [X3DH] Shared secret derived: {shared_secret[:8].hex()}...")
     print(f"  [SMT]  Root after X3DH logging: {log.current_root[:8].hex()}...")
 
     return X3DHResult(
-        shared_secret    = shared_secret,
-        ephemeral_key_pub= ek_pub,
-        session_id       = session_id,
+        shared_secret     = shared_secret,
+        ephemeral_key_pub = ek_pub,
+        session_id        = session_id,
     )
 
 
@@ -320,20 +375,19 @@ def x3dh_respond(
 ) -> Tuple[Optional[bytes], bool]:
     """
     Bob receives Alice's X3DH initiation and verifies against the SMT log.
-
     Returns (shared_secret, mitm_detected).
     If tampered=True, simulates an attacker substituting alice_ek_pub.
     """
     print(f"\n[X3DH] Bob responding to Alice's session (session={session_id})")
 
-    # ── MITM detection happens here ───────────────────────────────────────────
+    # ── MITM detection ────────────────────────────────────────────────────────
     print(f"  [VERIFY] Checking Alice's EK_A against SMT log...")
 
     key_in_log = log.verify_key(
-        owner      = f"alice_ek_{session_id}",
-        public_key = alice_ek_pub,
-        session_id = session_id,
-        event_type = "X3DH_EPHEMERAL",
+        owner         = f"alice_ek_{session_id}",
+        public_key    = alice_ek_pub,
+        session_id    = session_id,
+        event_type    = "X3DH_EPHEMERAL",
         expected_root = log.current_root,
     )
 
@@ -345,13 +399,16 @@ def x3dh_respond(
 
     print(f"  [VERIFY] EK_A verified against SMT log — OK")
 
-    # Compute same shared secret as Alice
-    dh1 = _dh(bob_bundle.signed_prekey_priv, alice_identity_pub)
-    dh2 = _dh(bob.private, alice_ek_pub)
-    dh3 = _dh(bob_bundle.signed_prekey_priv, alice_ek_pub)
-    dh4 = _dh(bob_bundle.one_time_prekey_priv, alice_ek_pub)
+    # Real X25519 DH operations (mirror of Alice's)
+    dh1 = _dh(bob_bundle.signed_prekey_priv,   alice_identity_pub)  # DH(SPK_B, IK_A)
+    dh2 = _dh(bob.private,                      alice_ek_pub)        # DH(IK_B,  EK_A)
+    dh3 = _dh(bob_bundle.signed_prekey_priv,    alice_ek_pub)        # DH(SPK_B, EK_A)
+    dh4 = _dh(bob_bundle.one_time_prekey_priv,  alice_ek_pub)        # DH(OPK_B, EK_A)
 
-    shared_secret = _hkdf(dh1 + dh2 + dh3 + dh4, b"X3DH_SK_" + session_id.encode())
+    shared_secret = _hkdf(
+        ikm  = dh1 + dh2 + dh3 + dh4,
+        info = b"X3DH_SK_" + session_id.encode(),
+    )
     print(f"  [X3DH] Shared secret derived: {shared_secret[:8].hex()}...")
 
     return shared_secret, False
@@ -363,19 +420,21 @@ def ratchet_init_sender(shared_secret: bytes, owner: str) -> RatchetState:
     """Initialise Alice's ratchet state from the X3DH shared secret."""
     rk = _hkdf(shared_secret, b"RATCHET_INIT_RK")
     ck = _hkdf(shared_secret, b"RATCHET_INIT_CK")
-    priv, pub = _generate_keypair()
+    priv, pub = _generate_keypair()   # real Curve25519 ratchet key
     return RatchetState(
-        root_key   = rk,
-        chain_key  = ck,
+        root_key     = rk,
+        chain_key    = ck,
         ratchet_priv = priv,
         ratchet_pub  = pub,
-        remote_pub = None,
-        owner      = owner,
+        remote_pub   = None,
+        owner        = owner,
     )
+
 
 def ratchet_init_receiver(shared_secret: bytes, owner: str) -> RatchetState:
     """Initialise Bob's ratchet state."""
     return ratchet_init_sender(shared_secret, owner)
+
 
 def ratchet_send(
     state: RatchetState,
@@ -386,13 +445,12 @@ def ratchet_send(
     """
     Send a message using the Double Ratchet.
     Logs the current DH ratchet public key to the SMT.
-
     Returns (ciphertext, message_key, ratchet_pub, new_state).
     """
     state.msg_number += 1
-
-    # Log current DH ratchet public key — THIS is what gets attacked
     event_type = f"RATCHET_MSG_{state.msg_number}"
+
+    # Log current DH ratchet public key — this is the key being attacked in Scenario 3
     log.log_key(
         owner      = f"{state.owner}_{session_id}",
         public_key = state.ratchet_pub,
@@ -400,12 +458,10 @@ def ratchet_send(
         event_type = event_type,
     )
 
-    # Derive message key from chain key
-    # RK, CK = KDF_RK(RK, DH(DHs, DHr))
-    message_key = _hkdf(state.chain_key, b"MSG_KEY_" + state.msg_number.to_bytes(4, "big"))
-    new_chain_key = _hkdf(state.chain_key, b"CHAIN_ADVANCE")
+    # Derive message key from chain key using HKDF
+    message_key   = _hkdf(state.chain_key, b"MSG_KEY_"    + state.msg_number.to_bytes(4, "big"))
+    new_chain_key = _hkdf(state.chain_key, b"CHAIN_ADVANCE" + state.msg_number.to_bytes(4, "big"))
 
-    # Update state
     new_state = RatchetState(
         root_key     = state.root_key,
         chain_key    = new_chain_key,
@@ -416,6 +472,7 @@ def ratchet_send(
         owner        = state.owner,
     )
 
+    # Real AES-256-GCM encryption
     ciphertext = _encrypt(message_key, plaintext)
     return ciphertext, message_key, state.ratchet_pub, new_state
 
@@ -433,17 +490,16 @@ def ratchet_receive(
     """
     Receive and verify a message.
     Verifies the sender's DH ratchet public key against the SMT log.
-
     Returns (plaintext, mitm_detected, new_state).
     """
     print(f"\n  [RATCHET] {state.owner} verifying msg #{msg_number} ratchet key...")
 
     event_type = f"RATCHET_MSG_{msg_number}"
-    key_valid = log.verify_key(
-        owner      = f"{sender_name}_{session_id}",
-        public_key = sender_ratchet_pub,
-        session_id = session_id,
-        event_type = event_type,
+    key_valid  = log.verify_key(
+        owner         = f"{sender_name}_{session_id}",
+        public_key    = sender_ratchet_pub,
+        session_id    = session_id,
+        event_type    = event_type,
         expected_root = log.current_root,
     )
 
@@ -452,12 +508,20 @@ def ratchet_receive(
         return None, True, state
 
     print(f"  [VERIFY] Ratchet key for msg #{msg_number} verified — OK")
+
+    # Derive message key (mirrors sender)
     message_key = _hkdf(state.chain_key, b"MSG_KEY_" + msg_number.to_bytes(4, "big"))
-    plaintext = _decrypt(message_key, ciphertext)
+
+    # Real AES-256-GCM decryption
+    try:
+        plaintext = _decrypt(message_key, ciphertext)
+    except ValueError:
+        print(f"  [!!! MITM DETECTED !!!] AES-GCM authentication tag FAILED — message tampered")
+        return None, True, state
 
     new_state = RatchetState(
         root_key     = state.root_key,
-        chain_key    = _hkdf(state.chain_key, b"CHAIN_ADVANCE"),
+        chain_key    = _hkdf(state.chain_key, b"CHAIN_ADVANCE" + msg_number.to_bytes(4, "big")),
         ratchet_priv = state.ratchet_priv,
         ratchet_pub  = state.ratchet_pub,
         remote_pub   = sender_ratchet_pub,
