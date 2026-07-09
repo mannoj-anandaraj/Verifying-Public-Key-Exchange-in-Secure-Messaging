@@ -129,11 +129,20 @@ def _expand_sk(signing_key_bytes: bytes) -> Tuple[bytes, bytes]:
     return bytes(scalar), h[32:]   # (clamped scalar, nonce prefix)
 
 
-def _hash_to_try_and_increment(pk_bytes: bytes, alpha: bytes) -> bytes:
+def _hash_to_curve_elligator2(pk_bytes: bytes, alpha: bytes) -> bytes:
     """
-    ECVRF_encode_to_try_and_increment (RFC 9381 Section 5.4.1.1).
-    Hashes (suite || 0x01 || pk || alpha || ctr) until a valid
-    Ed25519 point is found. Used for hash-to-curve.
+    ECVRF_hash_to_curve_elligator2_25519 (RFC 9381 Section 5.4.1.2),
+    as used by the ECVRF-EDWARDS25519-SHA512-ELL2 suite.
+
+    Note: this was previously misnamed '_hash_to_try_and_increment',
+    which describes the alternate construction in RFC 9381 Section
+    5.4.1.1. That method repeatedly hashes with an incrementing counter
+    and tests each candidate for validity as a curve point. This
+    function instead uses the Elligator2 map (Section 5.4.1.2), which is
+    defined for every 32-byte input, so no retry is cryptographically
+    necessary. The bounded loop below is retained only as a defensive
+    guard against a libsodium binding failure; under normal operation it
+    always returns on the ctr=0 iteration.
     """
     for ctr in range(256):
         h = _sha512(
@@ -287,7 +296,7 @@ def vrf_compute(keypair: VRFKeyPair, input_data: bytes) -> VRFProof:
     sk_scalar_bytes, nonce_prefix = _expand_sk(keypair.secret_key)
 
     # Step 1: hash input to Ed25519 curve point
-    H = _hash_to_try_and_increment(pk_bytes, input_data)
+    H = _hash_to_curve_elligator2(pk_bytes, input_data)
 
     # Step 2: Gamma = sk_scalar * H
     Gamma = crypto_scalarmult_ed25519_noclamp(sk_scalar_bytes, H)
@@ -358,7 +367,7 @@ def vrf_verify(
             return False
 
         # Step 2: recompute H from public key and input
-        H = _hash_to_try_and_increment(public_key, input_data)
+        H = _hash_to_curve_elligator2(public_key, input_data)
 
         # Step 3: U' = s*G - c*pk
         # U' = s*G + ((-c) mod order)*pk
