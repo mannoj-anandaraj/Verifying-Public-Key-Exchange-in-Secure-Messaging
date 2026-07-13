@@ -43,7 +43,7 @@ import nacl.hash
 from Crypto.Cipher import AES
 from Crypto.Random import get_random_bytes
 
-from smt import SparseMerkleTree, SMTProof
+from smt import SparseMerkleTree, WindowedSparseMerkleTree, SMTProof
 
 
 # ── Real Curve25519 / X25519 primitives ──────────────────────────────────────
@@ -220,8 +220,22 @@ class KeyTransparencyLog:
     formalised by Dowling et al. [9].
     """
 
-    def __init__(self):
-        self.tree = SparseMerkleTree()
+    def __init__(self, window_size: Optional[int] = None):
+        """
+        window_size=None (default) preserves the original unbounded
+        behaviour — every key logged stays live in the tree forever.
+        This keeps all existing call sites (demo.py, tests) unchanged.
+
+        window_size=N switches to WindowedSparseMerkleTree, bounding the
+        live tree to the N most recently logged keys. The full event
+        history is still kept in self.events regardless of windowing,
+        since that list is cheap (no tree recomputation) and is what
+        Phase 4 benchmarking and evaluation replay against.
+        """
+        self.tree: SparseMerkleTree = (
+            WindowedSparseMerkleTree(window_size) if window_size else SparseMerkleTree()
+        )
+        self.window_size = window_size
         self.events: List[LoggedKeyEvent] = []
 
     def log_key(
