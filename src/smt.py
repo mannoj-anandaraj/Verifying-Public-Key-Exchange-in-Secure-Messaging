@@ -324,3 +324,121 @@ class SparseMerkleTree:
             f"entries={self.size()}, "
             f"root={self.root[:8].hex()}...)"
         )
+
+
+# ── Sliding Window SMT (Phase B optimisation) ─────────────────────────────────
+
+class WindowedSparseMerkleTree(SparseMerkleTree):
+    """
+    Sliding-window variant of SparseMerkleTree.
+
+    The problem this solves
+    ------------------------
+    _compute_root() rebuilds the tree from every leaf currently stored in
+    self._leaves, on every single insert. For a short-lived key exchange
+    this is fine. But the Double Ratchet logs a new key on every message,
+    and a long-running conversation can involve thousands of messages.
+    Logging every one of those keys permanently means insert cost grows
+    linearly with the TOTAL number of messages ever sent in the
+    conversation, not just the current window of relevant messages —
+    measured at ~0.5ms for the 1st insert vs ~178ms for the 500th insert
+    in an unbounded tree (see benchmarks.py).
+
+    Why eviction is safe here
+    --------------------------
+    The Double Ratchet's forward secrecy property already discards old
+    message keys after use — a compromised MK_N reveals nothing about
+    MK_1 ... MK_(N-1). Verification of a ratchet key only needs to happen
+    shortly after that key is exchanged (see ratchet_receive() in
+    signal_sim.py, which verifies against log.current_root immediately
+    after log_key() runs). There is therefore no correctness requirement
+    to keep arbitrarily old ratchet keys live in the SMT — only the most
+    recent `window_size` keys need to support real-time inclusion proofs.
+
+    What happens to evicted keys
+    ------------------------------
+    Evicted leaves are removed from the live tree (so _compute_root() is
+    bounded by window_size, not total history) but are NOT silently lost:
+    each is recorded in `evicted_log` with the value and the root hash
+    that was current at the moment of eviction, preserving an audit trail.
+    Scope limitation: only (value, root) is archived, not the full
+    256-sibling proof — archiving full proofs for every evicted key would
+    reintroduce the unbounded memory growth this optimisation removes.
+    Reconstructing a full historical proof after eviction would require
+    replaying the event log (KeyTransparencyLog.events in signal_sim.py)
+    from scratch.
+
+    Trade-off
+    ---------
+    Bounded, constant-time-ish inserts vs. the ability to generate a live
+    inclusion proof for a key exchanged far in the past. This is the
+    trade-off explored quantitatively in the Evaluation chapter.
+    """
+
+    def __init__(self, window_size: int = 256):
+        if window_size < 1:
+            raise ValueError("window_size must be at least 1")
+        super().__init__()
+        self.window_size = window_size
+        self._insertion_order: List[int] = []          # paths, oldest first
+        self.evicted_log: Dict[int, Tuple[bytes, bytes]] = {}  # path -> (value, root_at_eviction)
+
+    def insert(self, key: bytes, value: bytes) -> bytes:
+        path = self._path(key)
+        is_new_path = path not in self._leaves
+
+        self._leaves[path] = _leaf_hash(value)
+        self._values[path] = value
+        if is_new_path:
+            self._insertion_order.append(path)
+
+        self._evict_if_needed()
+        self.root = self._compute_root()
+        return self.root
+
+    def delete(self, key: bytes) -> bytes:
+        path = self._path(key)
+        if path in self._insertion_order:
+            self._insertion_order.remove(path)
+        self.evicted_log.pop(path, None)
+        return super().delete(key)
+
+    def _evict_if_needed(self) -> None:
+        """Evict oldest entries (FIFO) until the window bound is satisfied."""
+        while len(self._insertion_order) > self.window_size:
+            oldest_path = self._insertion_order.pop(0)
+            if oldest_path in self._leaves:
+                self.evicted_log[oldest_path] = (
+                    self._values.get(oldest_path, b""),
+                    self.root,
+                )
+                del self._leaves[oldest_path]
+                self._values.pop(oldest_path, None)
+
+    def is_evicted(self, key: bytes) -> bool:
+        """True if this key was once logged but has since fallen outside the window."""
+        return self._path(key) in self.evicted_log
+
+    def get_evicted(self, key: bytes) -> Optional[Tuple[bytes, bytes]]:
+        """
+        Return (value, root_at_eviction) for a key that was evicted from
+        the live window, or None if the key was never logged or is still live.
+        """
+        return self.evicted_log.get(self._path(key))
+
+    def active_size(self) -> int:
+        """Number of leaves currently live in the window (== size())."""
+        return self.size()
+
+    def evicted_count(self) -> int:
+        """Number of leaves that have fallen out of the window over the tree's lifetime."""
+        return len(self.evicted_log)
+
+    def __repr__(self) -> str:
+        return (
+            f"WindowedSparseMerkleTree("
+            f"window={self.window_size}, "
+            f"active={self.active_size()}, "
+            f"evicted={self.evicted_count()}, "
+            f"root={self.root[:8].hex()}...)"
+        )
