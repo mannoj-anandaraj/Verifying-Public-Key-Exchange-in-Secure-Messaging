@@ -39,14 +39,15 @@ layer using two primitives:
 
 ## Current Progress
 
-- [x] Problem definition and threat model
-- [x] Architecture design — SMT + ECVRF integration
 - [x] Sparse Merkle Tree core implementation
-- [x] Sparse Merkle Tree unit tests
 - [x] ECVRF proof generation
 - [x] Signal Protocol simulation
 - [x] Key substitution attack simulation
-- [ ] Evaluation and write-up
+- [x] Sliding window optimisation (Phase B)
+- [x] 57 tests passing (SMT + ECVRF + real crypto)
+- [ ] Benchmarking write-up
+- [ ] Dissertation chapters (Overleaf)
+- [ ] Final submission
 
 ---
 
